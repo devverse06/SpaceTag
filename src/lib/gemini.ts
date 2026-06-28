@@ -1,7 +1,11 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { isSpaceAnnotations, type SpaceAnnotations } from "./types";
 
-const GEMINI_TIMEOUT_MS = 30_000;
+const GEMINI_TIMEOUT_MS = 45_000;
+const MAX_RETRIES = 3;
+
+// Current live models as of June 2026 (2.0 and 1.x are all shut down)
+const MODEL_PRIORITY = ["gemini-3.1-flash-lite", "gemini-3.5-flash"];
 
 const DEMO_ANNOTATIONS: SpaceAnnotations = {
   roomType: "Living Room",
@@ -46,17 +50,31 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   }
 }
 
-export function hasGeminiApiKey(): boolean {
-  return Boolean(process.env.GEMINI_API_KEY?.trim());
+function isRateLimitError(error: unknown): boolean {
+  if (error instanceof Error) {
+    const msg = error.message.toLowerCase();
+    return (
+      msg.includes("429") ||
+      msg.includes("quota") ||
+      msg.includes("rate limit") ||
+      msg.includes("resource_exhausted") ||
+      msg.includes("too many requests")
+    );
+  }
+  return false;
 }
 
-export async function analyzeImage(imageBase64: string, mimeType: string): Promise<SpaceAnnotations> {
-  if (!hasGeminiApiKey()) {
-    return { ...DEMO_ANNOTATIONS };
-  }
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+async function tryModel(
+  genAI: GoogleGenerativeAI,
+  modelName: string,
+  imageBase64: string,
+  mimeType: string,
+): Promise<SpaceAnnotations> {
+  const model = genAI.getGenerativeModel({ model: modelName });
 
   const result = await withTimeout(
     model.generateContent([
@@ -77,6 +95,58 @@ export async function analyzeImage(imageBase64: string, mimeType: string): Promi
   }
 
   return parseAnnotations(text);
+}
+
+export function hasGeminiApiKey(): boolean {
+  return Boolean(process.env.GEMINI_API_KEY?.trim());
+}
+
+export async function analyzeImage(imageBase64: string, mimeType: string): Promise<SpaceAnnotations> {
+  if (!hasGeminiApiKey()) {
+    return { ...DEMO_ANNOTATIONS };
+  }
+
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+
+  let lastError: unknown;
+
+  for (const modelName of MODEL_PRIORITY) {
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        console.log(`[Gemini] Trying model=${modelName} attempt=${attempt + 1}`);
+        const result = await tryModel(genAI, modelName, imageBase64, mimeType);
+        console.log(`[Gemini] Success with model=${modelName}`);
+        return result;
+      } catch (error) {
+        lastError = error;
+
+        if (isRateLimitError(error)) {
+          if (attempt < MAX_RETRIES - 1) {
+            const backoffMs = 2000 * Math.pow(2, attempt);
+            console.warn(`[Gemini] Rate limited on ${modelName}, backing off ${backoffMs}ms`);
+            await sleep(backoffMs);
+            continue;
+          } else {
+            console.warn(`[Gemini] Exhausted retries on ${modelName}, trying next model`);
+            break;
+          }
+        }
+
+        // Non-rate-limit error (404, parse failure, etc): skip to next model
+        console.warn(`[Gemini] Error on ${modelName}:`, (error as Error).message);
+        break;
+      }
+    }
+  }
+
+  if (isRateLimitError(lastError)) {
+    throw new Error(
+      "Gemini API quota exceeded. Please wait a moment and try again, or check your quota at https://aistudio.google.com",
+    );
+  }
+
+  const msg = lastError instanceof Error ? lastError.message : "All Gemini models failed";
+  throw new Error(msg);
 }
 
 export function extractBase64FromDataUrl(dataUrl: string): { data: string; mimeType: string } {
